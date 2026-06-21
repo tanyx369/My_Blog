@@ -1,0 +1,308 @@
+from fastapi import FastAPI, Request, HTTPException, status, Depends
+from fastapi.staticfiles import StaticFiles
+from fastapi.exceptions import RequestValidationError # handle validation error 
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
+
+# FastAPI is built on top of Starlette 
+# IF we just use the HTTPException from fastapi then it will only catch the error built in our script 
+# Hence we need to use the exception from starlette to capture other exception that are not stated in our script 
+from starlette.exceptions import HTTPException as StarletteHTTPException 
+from sqlalchemy import select, func, text  # Help us to do query
+from sqlalchemy.orm import Session, selectinload  # Session use for type hints 
+from sqlalchemy.ext.asyncio import AsyncSession
+from contextlib import asynccontextmanager
+
+# from app.schemas import PostCreate, PostResponse, PostUpdate, UserResponse, UserCreate, UserUpdate (we no longer use them here after using router)
+from app.database import Base, engine, get_db # Base & engine help us to create table ; get_db provides database sessions 
+import app.models as models
+from config import settings
+from routers import posts, users
+from typing import Annotated
+
+# Create database tables
+# This look at all the models inherited from Base and create table if haven't created 
+# If the table already exists, then nothing happen
+
+# Base.metadata.create_all(bind=engine) synchronus method 
+
+# asynchronus method 
+# @asynccontextmanager
+# async def lifespan(_app:FastAPI):
+#     # Startup
+#     async with engine.begin() as conn:
+#         await conn.run_sync(Base.metadata.create_all)
+#     yield
+    
+#     # shutdown
+#     await engine.dispose()
+
+
+@asynccontextmanager
+async def lifespan(_app:FastAPI):
+    yield
+    
+    # shutdown
+    await engine.dispose()
+
+
+app = FastAPI(lifespan=lifespan) 
+
+# app.mount('_directory_', StaticFiles(directory='directory_name'), name=ref_name_for_use_in_template)
+app.mount("/static", StaticFiles(directory='static'), name='static')
+app.mount('/media', StaticFiles(directory='media'), name='media')
+
+# We save our templates in the 'templates' folder and use JinJa2 object to access them
+templates = Jinja2Templates(directory="templates")
+
+app.include_router(users.router, prefix='/api/users', tags=['users'])
+app.include_router(posts.router, prefix='/api/posts', tags=['posts'])
+# FastAPI uses function name as default to search for route
+# Hence the template function names should not be the same as router function name
+
+
+### Sample Data (no need after we have a proper database)
+
+# posts: list[dict] = [
+#     {
+#         "id": 1,
+#         "author": "Corey Schafer",
+#         "title": "FastAPI is Awesome",
+#         "content": "This framework is really easy to use and super fast.",
+#         "date_posted": "April 20, 2025",
+#     },
+#     {
+#         "id": 2,
+#         "author": "Jane Doe",
+#         "title": "Python is Great for Web Development",
+#         "content": "Python is a great language for web development, and FastAPI makes it even better.",
+#         "date_posted": "April 21, 2025",
+#     },
+# ]
+
+
+## Health Check Endpoint (used to check database connectivity)
+@app.get("/health")
+async def health_check(db: Annotated[AsyncSession, Depends(get_db)]):
+    try:
+        await db.execute(text("SELECT 1"))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable",
+        ) from exc
+    return {"status": "healthy"}
+
+
+##### Main Functions (Template routes) ######
+
+##### (1) #####
+
+# By stacking two route, we can make that the two endpoints will lead to the same function
+# @app.get("/", response_class=HTMLResponse)
+# @app.get("/posts", response_class=HTMLResponse)
+
+# Now we are using Jinja2 templates 
+@app.get("/", include_in_schema=False, name="home")
+@app.get("/posts", include_in_schema=False, name="posts")
+async def home(request: Request, db: Annotated[AsyncSession, Depends(get_db)]):
+    count_result = await db.execute(select(func.count()).select_from(models.Post))
+    total = count_result.scalar() or 0
+
+    result = await db.execute(
+        select(models.Post)
+        .options(selectinload(models.Post.author))
+        .order_by(models.Post.date_posted.desc())
+        .limit(settings.posts_per_page),
+    )
+    posts = result.scalars().all()
+
+    has_more = len(posts) < total
+
+    return templates.TemplateResponse(
+        request,
+        "home.html",
+        {
+            "posts": posts,
+            "title": "Home",
+            "limit": settings.posts_per_page,
+            "has_more": has_more,
+        },
+    )
+
+##### (2) #####
+
+## post_page
+@app.get("/posts/{post_id}", include_in_schema=False)
+async def post_page(request: Request, post_id: int, db: Annotated[AsyncSession, Depends(get_db)]):
+    result = await db.execute(select(models.Post).options(selectinload(models.Post.author)).where(models.Post.id == post_id))
+    post = result.scalars().first()
+    if post:
+        title = post.title[:50]
+        return templates.TemplateResponse(
+            request,
+            "post.html",
+            {"post": post, "title": title},
+        )
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Post not found")
+
+#### (3) ####
+
+## user_posts_page
+@app.get("/users/{user_id}/posts", include_in_schema=False, name="user_posts")
+async def user_posts_page(
+    request: Request,
+    user_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    result = await db.execute(select(models.User).where(models.User.id == user_id))
+    user = result.scalars().first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
+    count_result = await db.execute(
+        select(func.count())
+        .select_from(models.Post)
+        .where(models.Post.user_id == user_id),
+    )
+    total = count_result.scalar() or 0
+
+    result = await db.execute(
+        select(models.Post)
+        .options(selectinload(models.Post.author))
+        .where(models.Post.user_id == user_id)
+        .order_by(models.Post.date_posted.desc())
+        .limit(settings.posts_per_page),
+    )
+    posts = result.scalars().all()
+
+    has_more = len(posts) < total
+
+    return templates.TemplateResponse(
+        request,
+        "user_posts.html",
+        {
+            "posts": posts,
+            "user": user,
+            "title": f"{user.username}'s Posts",
+            "limit": settings.posts_per_page,
+            "has_more": has_more,
+        },
+    )
+
+
+
+## login and register template_routes
+@app.get("/login", include_in_schema=False)
+async def login_page(request: Request):
+    return templates.TemplateResponse(
+        request,
+        "login.html",
+        {"title": "Login"},
+    )
+
+
+@app.get("/register", include_in_schema=False)
+async def register_page(request: Request):
+    return templates.TemplateResponse(
+        request,
+        "register.html",
+        {"title": "Register"},
+    )
+
+
+@app.get("/account", include_in_schema=False)
+async def account_page(request: Request):
+    return templates.TemplateResponse(
+        request,
+        "account.html",
+        {"title": "Account"},
+    )
+
+
+
+@app.get("/forgot-password", include_in_schema=False)
+async def forgot_password_page(request: Request):
+    return templates.TemplateResponse(
+        request,
+        "forgot_password.html",
+        {"title": "Forgot Password"},
+    )
+
+
+@app.get("/reset-password", include_in_schema=False)
+async def reset_password_page(request: Request):
+    response = templates.TemplateResponse(
+        request,
+        "reset_password.html",
+        {"title": "Reset Password"},
+    )
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+
+
+##### API Endpoints for documentation ######
+
+
+
+
+##### Exception Handler ######
+# create a general exception handler and lead to the error page template
+
+## StarletteHTTPException Handler
+@app.exception_handler(StarletteHTTPException)
+async def general_http_exception_handler(request: Request, exception: StarletteHTTPException):
+    
+
+    if request.url.path.startswith("/api"):
+        # return JSONResponse(
+        #     status_code=exception.status_code,
+        #     content={"detail": message},
+        # )
+        return(await http_exception_handler(request, exception))
+    
+    message = (
+        exception.detail
+        if exception.detail
+        else "An error occurred. Please check your request and try again."
+    )
+    
+    return templates.TemplateResponse(
+        request,
+        "error.html",
+        {
+            "status_code": exception.status_code,
+            "title": exception.status_code,
+            "message": message,
+        },
+        status_code=exception.status_code,  # we need to pass in so that to ensure the browser will get the correct status code, otherwise it will assume successful since we have smth return to it 
+    )
+
+# Since starlette can capture any exception, we no need to specify the href in error.html.
+# Once the fastapi captured error, it will directly lead to @app.exception_handler(StarletteHTTPException)
+
+### RequestValidationError Handler
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exception: RequestValidationError):
+    if request.url.path.startswith("/api"):
+        # return JSONResponse(
+        #     status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        #     content={"detail": exception.errors()},
+        # )
+        return(await request_validation_exception_handler(request, exception))
+    return templates.TemplateResponse(
+        request,
+        "error.html",
+        {
+            "status_code": status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "title": status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "message": "Invalid request. Please check your input and try again.",
+        },
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+    )
